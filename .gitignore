@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Reproducibility assets are inventoried by checksum, not stored in Git.
+*.pt
+*.jpg
+
+# Runtime-generated tester snapshots and reproduction outputs.
+NEW_py_ver/**/POMO/result/*_test__*/
+reproduction_outputs/
+
