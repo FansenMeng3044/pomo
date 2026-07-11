@@ -3,6 +3,7 @@
 import argparse
 import csv
 import hashlib
+import json
 import platform
 import subprocess
 import sys
@@ -68,6 +69,16 @@ CSV_FIELDS = [
     "no_aug_diagnostic_score",
     "x8_aug_score",
     "elapsed_seconds",
+    "warmup_batches",
+    "warmup_batch_size",
+    "timing_scope",
+    "timed_h2d",
+    "timed_augmentation",
+    "per_instance_output",
+    "per_instance_sha256",
+    "per_instance_metadata",
+    "per_instance_metadata_sha256",
+    "per_instance_count",
     "device",
     "cuda_device",
     "evaluation_seed",
@@ -266,20 +277,27 @@ def run_one_batch(env, model, problems, start, batch_size, device):
                 tuple(reward.shape), expected_reward_shape
             )
         )
-    if not torch.isfinite(reward).all().item():
-        raise RuntimeError("Model reward contains NaN or Inf.")
-
     # Official augment_xy_data_by_8_fold concatenates full batches in fold order,
     # so reshape(8, batch, pomo) exactly matches the official TSPTester layout.
     aug_reward = reward.reshape(aug_factor, batch_size, env.pomo_size)
     best_pomo_reward = aug_reward.max(dim=2).values
     no_aug_costs = -best_pomo_reward[0].float()
     x8_costs = -best_pomo_reward.max(dim=0).values.float()
-    if torch.any(x8_costs > no_aug_costs + 1e-6).item():
-        raise RuntimeError(
-            "x8 cost exceeded no-augmentation cost although x8 contains fold 0."
+    return no_aug_costs.detach(), x8_costs.detach()
+
+
+def write_per_instance_csv(path, no_aug_costs, x8_costs):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["instance_index", "no_aug_diagnostic_cost", "x8_best_cost"]
         )
-    return no_aug_costs.double().sum().item(), x8_costs.double().sum().item()
+        for instance_index, (no_aug_cost, x8_cost) in enumerate(
+            zip(no_aug_costs.tolist(), x8_costs.tolist())
+        ):
+            writer.writerow(
+                [instance_index, repr(float(no_aug_cost)), repr(float(x8_cost))]
+            )
 
 
 def main():
@@ -320,7 +338,20 @@ def main():
         default=1234,
         help="Recorded process seed; argmax x8 inference itself is deterministic.",
     )
+    parser.add_argument(
+        "--warmup-batches",
+        type=int,
+        default=1,
+        help="Complete x8 batches to run before synchronized timing.",
+    )
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--per-instance-output",
+        default=None,
+        help=(
+            "Per-instance CSV path. Default: <output stem>.per_instance.csv."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -350,6 +381,8 @@ def main():
     )
     if batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if args.warmup_batches < 0:
+        raise ValueError("--warmup-batches must be non-negative.")
     batch_size_basis = (
         case_config["batch_size_basis"]
         if args.batch_size is None
@@ -357,9 +390,21 @@ def main():
     )
 
     output = Path(args.output).expanduser().resolve()
-    if output.exists() and not args.overwrite:
+    per_instance_output = (
+        Path(args.per_instance_output).expanduser().resolve()
+        if args.per_instance_output is not None
+        else output.with_name(output.stem + ".per_instance.csv")
+    )
+    per_instance_metadata = per_instance_output.with_name(
+        per_instance_output.name + ".metadata.json"
+    )
+    output_paths = (output, per_instance_output, per_instance_metadata)
+    existing_outputs = [path for path in output_paths if path.exists()]
+    if existing_outputs and not args.overwrite:
         raise FileExistsError(
-            "Refusing to overwrite {}. Pass --overwrite explicitly.".format(output)
+            "Refusing to overwrite {}. Pass --overwrite explicitly.".format(
+                ", ".join(str(path) for path in existing_outputs)
+            )
         )
 
     torch.manual_seed(args.evaluation_seed)
@@ -382,30 +427,99 @@ def main():
     model.load_state_dict(state["model_state_dict"], strict=True)
     model.eval()
 
-    totals = {"no_aug": 0.0, "x8": 0.0}
+    warmup_batch_size = min(batch_size, episodes)
+    with torch.no_grad():
+        for _ in range(args.warmup_batches):
+            run_one_batch(
+                env, model, problems, 0, warmup_batch_size, device
+            )
+
+    no_aug_batches = []
+    x8_batches = []
     seen = 0
     synchronize_cuda(device)
     started = time.perf_counter()
     with torch.no_grad():
         while seen < episodes:
             current_batch = min(batch_size, episodes - seen)
-            no_aug_sum, x8_sum = run_one_batch(
+            no_aug_batch, x8_batch = run_one_batch(
                 env, model, problems, seen, current_batch, device
             )
-            totals["no_aug"] += no_aug_sum
-            totals["x8"] += x8_sum
+            no_aug_batches.append(no_aug_batch)
+            x8_batches.append(x8_batch)
             seen += current_batch
-            print(
-                "{}/{} no_aug_diagnostic={:.4f} x8={:.4f}".format(
-                    seen,
-                    episodes,
-                    no_aug_sum / current_batch,
-                    x8_sum / current_batch,
-                ),
-                flush=True,
-            )
     synchronize_cuda(device)
     elapsed_seconds = time.perf_counter() - started
+
+    no_aug_costs = torch.cat(no_aug_batches).float().cpu()
+    x8_costs = torch.cat(x8_batches).float().cpu()
+    if no_aug_costs.numel() != episodes or x8_costs.numel() != episodes:
+        raise RuntimeError("Per-instance cost count does not match episodes.")
+    if not torch.isfinite(no_aug_costs).all().item():
+        raise RuntimeError("No-augmentation costs contain NaN or Inf.")
+    if not torch.isfinite(x8_costs).all().item():
+        raise RuntimeError("x8 costs contain NaN or Inf.")
+    if torch.any(x8_costs > no_aug_costs + 1e-6).item():
+        raise RuntimeError(
+            "x8 cost exceeded no-augmentation cost although x8 contains fold 0."
+        )
+
+    no_aug_mean = no_aug_costs.double().mean().item()
+    x8_mean = x8_costs.double().mean().item()
+    git_info = git_metadata(pomo_root)
+    environment_info = environment_metadata(device)
+    checkpoint_sha256 = sha256_file(checkpoint)
+    test_data_sha256 = sha256_file(test_data_path)
+
+    per_instance_output.parent.mkdir(parents=True, exist_ok=True)
+    write_per_instance_csv(per_instance_output, no_aug_costs, x8_costs)
+    per_instance_sha256 = sha256_file(per_instance_output)
+    per_instance_metadata_payload = {
+        "format_version": 1,
+        "problem": "TSP",
+        "problem_size": args.problem_size,
+        "episodes": episodes,
+        "instance_index_start": 0,
+        "instance_index_stop_exclusive": episodes,
+        "test_data": str(test_data_path),
+        "test_data_sha256": test_data_sha256,
+        "test_data_total_instances": problems.size(0),
+        "test_data_seed": test_metadata.get("seed", ""),
+        "test_data_generator": test_metadata.get("generator", "unrecorded"),
+        "test_subset": "prefix[0:{}]".format(episodes),
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_epoch": case_config["checkpoint_epoch"],
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_load": "strict_ok",
+        "eval_type": MODEL_PARAMS["eval_type"],
+        "aug_factor": 8,
+        "batch_size": batch_size,
+        "batch_size_basis": batch_size_basis,
+        "evaluation_seed": args.evaluation_seed,
+        "warmup_batches": args.warmup_batches,
+        "warmup_batch_size": warmup_batch_size,
+        "elapsed_seconds": elapsed_seconds,
+        "timed_h2d": True,
+        "timed_augmentation": True,
+        "timing_scope": (
+            "Includes CPU slice, H2D, x8 augmentation, model rollout, and "
+            "POMO/x8 reduction; excludes loading, warm-up, logging, D2H, "
+            "serialization, and hashing."
+        ),
+        "no_aug_diagnostic_mean": no_aug_mean,
+        "x8_best_mean": x8_mean,
+        "cost_dtype": str(no_aug_costs.dtype),
+        "containment_tolerance": 1e-6,
+        "per_instance_count": no_aug_costs.numel(),
+        "per_instance_output": str(per_instance_output),
+        "per_instance_sha256": per_instance_sha256,
+    }
+    per_instance_metadata_payload.update(git_info)
+    per_instance_metadata_payload.update(environment_info)
+    with per_instance_metadata.open("w", encoding="utf-8") as handle:
+        json.dump(per_instance_metadata_payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    per_instance_metadata_sha256 = sha256_file(per_instance_metadata)
 
     row = {
         "problem": "TSP",
@@ -415,10 +529,10 @@ def main():
         "eval_type": MODEL_PARAMS["eval_type"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_epoch": case_config["checkpoint_epoch"],
-        "checkpoint_sha256": sha256_file(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_load": "strict_ok",
         "test_data": str(test_data_path),
-        "test_data_sha256": sha256_file(test_data_path),
+        "test_data_sha256": test_data_sha256,
         "test_data_total_instances": problems.size(0),
         "test_data_seed": test_metadata.get("seed", ""),
         "test_data_generator": test_metadata.get("generator", "unrecorded"),
@@ -427,9 +541,19 @@ def main():
         "batch_size": batch_size,
         "batch_size_basis": batch_size_basis,
         "aug_factor": 8,
-        "no_aug_diagnostic_score": totals["no_aug"] / episodes,
-        "x8_aug_score": totals["x8"] / episodes,
+        "no_aug_diagnostic_score": no_aug_mean,
+        "x8_aug_score": x8_mean,
         "elapsed_seconds": elapsed_seconds,
+        "warmup_batches": args.warmup_batches,
+        "warmup_batch_size": warmup_batch_size,
+        "timing_scope": per_instance_metadata_payload["timing_scope"],
+        "timed_h2d": True,
+        "timed_augmentation": True,
+        "per_instance_output": str(per_instance_output),
+        "per_instance_sha256": per_instance_sha256,
+        "per_instance_metadata": str(per_instance_metadata),
+        "per_instance_metadata_sha256": per_instance_metadata_sha256,
+        "per_instance_count": no_aug_costs.numel(),
         "device": str(device),
         "evaluation_seed": args.evaluation_seed,
         "note": (
@@ -437,8 +561,8 @@ def main():
             "only; x8_aug_score is the formal target."
         ),
     }
-    row.update(git_metadata(pomo_root))
-    row.update(environment_metadata(device))
+    row.update(git_info)
+    row.update(environment_info)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as handle:

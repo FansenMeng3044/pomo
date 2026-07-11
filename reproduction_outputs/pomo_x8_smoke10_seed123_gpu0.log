@@ -1,0 +1,5 @@
+tsp20: 10/10 no_aug_diagnostic=3.6309 x8=3.6308
+tsp50: 10/10 no_aug_diagnostic=5.5971 x8=5.5963
+tsp100: 10/10 no_aug_diagnostic=7.7193 x8=7.6919
+cvrp100: 10/10 no_aug_diagnostic=15.6327 x8=15.5858
+Wrote /root/mfs/POMO/reproduction_outputs/pomo_x8_smoke10_seed123_gpu0.csv

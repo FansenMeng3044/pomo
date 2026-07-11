@@ -1,0 +1,56 @@
+[
+  {
+    "coordinates_in_unit_interval": true,
+    "dtype": "torch.float32",
+    "finite": true,
+    "generation_device": "cpu",
+    "metadata_consistent": true,
+    "path": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp20_n100000_seed1234.pt",
+    "roundtrip_equal_torch_equal": true,
+    "sha256": "533ec34d6562044c047e455afbb849cf121e824843a1599a5c25de7d4bbcdc1e",
+    "shape": [
+      100000,
+      20,
+      2
+    ],
+    "sidecar": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp20_n100000_seed1234.pt.metadata.json",
+    "sidecar_sha256": "7c2b3066629f0cbbdb4381e36efabce69f0d745115ebef99f35dbe35f496e23d",
+    "size_bytes": 16001752
+  },
+  {
+    "coordinates_in_unit_interval": true,
+    "dtype": "torch.float32",
+    "finite": true,
+    "generation_device": "cpu",
+    "metadata_consistent": true,
+    "path": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp50_n100000_seed1234.pt",
+    "roundtrip_equal_torch_equal": true,
+    "sha256": "4ca8c3abcae2384bfcd03f4a24a6baaebe71f9ac3c017973c9087aa11a15e19b",
+    "shape": [
+      100000,
+      50,
+      2
+    ],
+    "sidecar": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp50_n100000_seed1234.pt.metadata.json",
+    "sidecar_sha256": "d856df5f795ea7fe2a95f124ea19a16408b57c6f2a7dcb71d2cc85c9e454fe2d",
+    "size_bytes": 40001752
+  },
+  {
+    "coordinates_in_unit_interval": true,
+    "dtype": "torch.float32",
+    "finite": true,
+    "generation_device": "cpu",
+    "metadata_consistent": true,
+    "path": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp100_n100000_seed1234.pt",
+    "roundtrip_equal_torch_equal": true,
+    "sha256": "8f2a91e86f1c8441cc5103b405b7133487e9c4ea8da64bfcf6d75fe03db3c794",
+    "shape": [
+      100000,
+      100,
+      2
+    ],
+    "sidecar": "/root/mfs/POMO/reproduction_data/fixed_testsets/tsp100_n100000_seed1234.pt.metadata.json",
+    "sidecar_sha256": "32201d12a4f3f054caa7443426b3876937325cfdfa2b8512bc7456f9143f3146",
+    "size_bytes": 80001755
+  }
+]
