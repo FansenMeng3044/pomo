@@ -31,6 +31,8 @@ class CaseConfig:
     default_episodes: int
     aug_batch_size: int
     batch_size_basis: str
+    no_aug_batch_size: int = None
+    no_aug_batch_size_basis: str = ""
     saved_test_data: Path = None
     note: str = ""
 
@@ -51,7 +53,9 @@ CSV_FIELDS = [
     "n",
     "run_scope",
     "formal_target",
+    "evaluation_mode",
     "primary_metric",
+    "primary_score",
     "eval_type",
     "checkpoint",
     "checkpoint_epoch",
@@ -193,7 +197,12 @@ def build_cases(pomo_root):
             30500,
             10_000,
             400,
-            "official NEW_py_ver/CVRP/POMO/test_n100.py",
+            "official NEW_py_ver/CVRP/POMO/test_n100.py x8 aug_batch_size",
+            no_aug_batch_size=1_000,
+            no_aug_batch_size_basis=(
+                "official NEW_py_ver/CVRP/POMO/test_n100.py "
+                "no-augmentation test_batch_size"
+            ),
             saved_test_data=new_py / "CVRP" / "vrp100_test_seed1234.pt",
             note="Uses the official fixed CVRP100 test set.",
         ),
@@ -300,8 +309,10 @@ def make_env_and_model(case, pomo_root):
     return Env(problem_size=case.size, pomo_size=case.size), Model(**MODEL_PARAMS)
 
 
-def run_one_batch(env, model, batch_size):
-    aug_factor = 8
+def run_one_batch(env, model, batch_size, aug_factor):
+    if aug_factor not in (1, 8):
+        raise ValueError("aug_factor must be 1 or 8.")
+
     env.load_problems(batch_size, aug_factor)
     reset_state, _, _ = env.reset()
     model.pre_forward(reset_state)
@@ -324,12 +335,17 @@ def run_one_batch(env, model, batch_size):
     aug_reward = reward.reshape(aug_factor, batch_size, env.pomo_size)
     best_pomo_reward = aug_reward.max(dim=2).values
     no_aug_costs = -best_pomo_reward[0].float()
+    no_aug_sum = no_aug_costs.double().sum().item()
+
+    if aug_factor == 1:
+        return no_aug_sum, None
+
     x8_costs = -best_pomo_reward.max(dim=0).values.float()
     if torch.any(x8_costs > no_aug_costs + 1e-6).item():
         raise RuntimeError(
             "x8 cost exceeded no-augmentation cost although x8 contains fold 0."
         )
-    return no_aug_costs.double().sum().item(), x8_costs.double().sum().item()
+    return no_aug_sum, x8_costs.double().sum().item()
 
 
 def run_case(
@@ -340,10 +356,17 @@ def run_case(
     cuda_device,
     seed,
     mode,
+    aug_factor,
     batch_size_override,
 ):
     if episodes <= 0:
         raise ValueError("Episode count must be positive.")
+    if aug_factor not in (1, 8):
+        raise ValueError("aug_factor must be 1 or 8.")
+    if aug_factor == 1 and case.no_aug_batch_size is None:
+        raise ValueError(
+            "No-augmentation mode is not configured for case {}.".format(case.name)
+        )
     checkpoint, test_data_total_instances = validate_case(case, episodes)
 
     torch.manual_seed(seed)
@@ -366,20 +389,18 @@ def run_case(
     if case.problem == "CVRP":
         env.use_saved_problems(str(case.saved_test_data), device)
 
-    configured_batch_size = (
-        case.aug_batch_size
-        if batch_size_override is None
-        else batch_size_override
-    )
+    if batch_size_override is not None:
+        configured_batch_size = batch_size_override
+        batch_size_basis = "explicit command-line value"
+    elif aug_factor == 1:
+        configured_batch_size = case.no_aug_batch_size
+        batch_size_basis = case.no_aug_batch_size_basis
+    else:
+        configured_batch_size = case.aug_batch_size
+        batch_size_basis = case.batch_size_basis
     if configured_batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     actual_batch_size = min(configured_batch_size, episodes)
-    batch_size_basis = (
-        case.batch_size_basis
-        if batch_size_override is None
-        else "explicit command-line value"
-    )
-
     totals = {"no_aug": 0.0, "x8": 0.0}
     seen = 0
     synchronize_cuda(device)
@@ -387,20 +408,29 @@ def run_case(
     with torch.no_grad():
         while seen < episodes:
             current_batch = min(actual_batch_size, episodes - seen)
-            no_aug_sum, x8_sum = run_one_batch(env, model, current_batch)
+            no_aug_sum, x8_sum = run_one_batch(
+                env, model, current_batch, aug_factor
+            )
             totals["no_aug"] += no_aug_sum
-            totals["x8"] += x8_sum
+            if x8_sum is not None:
+                totals["x8"] += x8_sum
             seen += current_batch
-            print(
-                "{}: {}/{} no_aug_diagnostic={:.4f} x8={:.4f}".format(
+            if aug_factor == 1:
+                message = "{}: {}/{} no_aug={:.4f}".format(
+                    case.name,
+                    seen,
+                    episodes,
+                    no_aug_sum / current_batch,
+                )
+            else:
+                message = "{}: {}/{} no_aug_diagnostic={:.4f} x8={:.4f}".format(
                     case.name,
                     seen,
                     episodes,
                     no_aug_sum / current_batch,
                     x8_sum / current_batch,
-                ),
-                flush=True,
-            )
+                )
+            print(message, flush=True)
     synchronize_cuda(device)
     elapsed_seconds = time.perf_counter() - started
 
@@ -416,7 +446,17 @@ def run_case(
         "n": case.size,
         "run_scope": mode,
         "formal_target": is_formal,
-        "primary_metric": "x8_aug_score",
+        "evaluation_mode": (
+            "no_augmentation" if aug_factor == 1 else "x8_augmentation"
+        ),
+        "primary_metric": (
+            "no_aug_diagnostic_score" if aug_factor == 1 else "x8_aug_score"
+        ),
+        "primary_score": (
+            totals["no_aug"] / episodes
+            if aug_factor == 1
+            else totals["x8"] / episodes
+        ),
         "eval_type": MODEL_PARAMS["eval_type"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_epoch": case.checkpoint_epoch,
@@ -433,9 +473,11 @@ def run_case(
         "episodes": episodes,
         "batch_size": actual_batch_size,
         "batch_size_basis": batch_size_basis,
-        "aug_factor": 8,
+        "aug_factor": aug_factor,
         "no_aug_diagnostic_score": totals["no_aug"] / episodes,
-        "x8_aug_score": totals["x8"] / episodes,
+        "x8_aug_score": (
+            "" if aug_factor == 1 else totals["x8"] / episodes
+        ),
         "elapsed_seconds": elapsed_seconds,
         "device": str(device),
         "seed": seed,
@@ -460,7 +502,7 @@ def write_csv(rows, output, overwrite):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run POMO x8 checkpoint smoke checks and CVRP100 fixed evaluation."
+        description="Run POMO checkpoint smoke checks and CVRP100 fixed evaluation."
     )
     parser.add_argument(
         "--pomo-root",
@@ -491,6 +533,14 @@ def main():
     parser.add_argument("--cuda-device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
+        "--no-augmentation",
+        action="store_true",
+        help=(
+            "Run the configured no-augmentation POMO mode (CVRP100 only). "
+            "Without this flag, use x8 augmentation."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=str(
             DEFAULT_POMO_ROOT
@@ -517,6 +567,8 @@ def main():
             "Use run_pomo_tsp_fixed_eval.py with --test-data."
         )
 
+    aug_factor = 1 if args.no_augmentation else 8
+
     rows = []
     for name in args.cases:
         case = cases[name]
@@ -534,6 +586,7 @@ def main():
                 args.cuda_device,
                 args.seed,
                 args.mode,
+                aug_factor,
                 args.batch_size,
             )
         )
