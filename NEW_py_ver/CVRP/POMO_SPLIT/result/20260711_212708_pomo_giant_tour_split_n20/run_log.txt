@@ -1,0 +1,4 @@
+[2026-07-11 20:27:08] train_n100.py(75) : env_params={'problem_size': 20, 'pomo_size': 20, 'capacity': 1.0}
+[2026-07-11 20:27:08] train_n100.py(76) : model_params={'embedding_dim': 128, 'sqrt_embedding_dim': 11.313708498984761, 'encoder_layer_num': 6, 'qkv_dim': 16, 'head_num': 8, 'logit_clipping': 10, 'ff_hidden_dim': 512, 'eval_type': 'argmax'}
+[2026-07-11 20:27:08] train_n100.py(77) : optimizer_params={'optimizer': {'lr': 0.0001, 'weight_decay': 1e-06}, 'scheduler': {'milestones': [8001, 8051], 'gamma': 0.1}}
+[2026-07-11 20:27:08] train_n100.py(78) : trainer_params={'use_cuda': False, 'cuda_device_num': 0, 'epochs': 1, 'train_episodes': 4, 'train_batch_size': 2, 'logging': {'model_save_interval': 500}, 'model_load': {'enable': False}}
