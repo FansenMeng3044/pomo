@@ -32,6 +32,13 @@ class GiantTourEnv:
         if self.pomo_size > self.problem_size:
             raise ValueError("pomo_size cannot exceed problem_size")
 
+        # Optional fixed-test-set support (mirrors CVRPEnv.use_saved_problems).
+        self.FLAG__use_saved_problems = False
+        self.saved_depot_xy = None
+        self.saved_node_xy = None
+        self.saved_node_demand = None
+        self.saved_index = 0
+
         self.batch_size = None
         self.depot_xy = None
         self.node_xy = None
@@ -44,9 +51,31 @@ class GiantTourEnv:
         self.step_state = None
         self.last_split_result = None
 
+    def use_saved_problems(self, filename, device=None):
+        """Load a fixed CVRP test set so evaluation matches the official runs.
+
+        The file must be the same format used by CVRPEnv.use_saved_problems: a
+        dict with depot_xy (N,1,2), node_xy (N,n,2) and node_demand (N,n), where
+        demands are already normalized to the vehicle capacity.
+        """
+        map_location = device if device is not None else self.device
+        loaded_dict = torch.load(filename, map_location=map_location)
+        self.saved_depot_xy = loaded_dict["depot_xy"]
+        self.saved_node_xy = loaded_dict["node_xy"]
+        self.saved_node_demand = loaded_dict["node_demand"]
+        self.saved_index = 0
+        self.FLAG__use_saved_problems = True
+
     def load_problems(self, batch_size, aug_factor=1):
         self.batch_size = batch_size
-        depot_xy, node_xy, node_demand = get_random_problems(batch_size, self.problem_size)
+        if not self.FLAG__use_saved_problems:
+            depot_xy, node_xy, node_demand = get_random_problems(batch_size, self.problem_size)
+        else:
+            end = self.saved_index + batch_size
+            depot_xy = self.saved_depot_xy[self.saved_index:end]
+            node_xy = self.saved_node_xy[self.saved_index:end]
+            node_demand = self.saved_node_demand[self.saved_index:end]
+            self.saved_index = end
         depot_xy = depot_xy.to(self.device)
         node_xy = node_xy.to(self.device)
         node_demand = node_demand.to(self.device)

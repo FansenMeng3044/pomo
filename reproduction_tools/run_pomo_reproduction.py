@@ -35,6 +35,7 @@ class CaseConfig:
     no_aug_batch_size_basis: str = ""
     saved_test_data: Path = None
     note: str = ""
+    use_split: bool = False
 
 
 MODEL_PARAMS = {
@@ -51,6 +52,8 @@ CSV_FIELDS = [
     "case",
     "problem",
     "n",
+    "use_split",
+    "model_kind",
     "run_scope",
     "formal_target",
     "evaluation_mode",
@@ -209,6 +212,33 @@ def build_cases(pomo_root):
     }
 
 
+def build_split_case(pomo_root, args):
+    if args.split_checkpoint_dir is None or args.split_epoch is None:
+        raise ValueError(
+            "--use-split requires both --split-checkpoint-dir and --split-epoch."
+        )
+    new_py = pomo_root / "NEW_py_ver"
+    if args.split_test_data is not None:
+        test_data = Path(args.split_test_data).expanduser().resolve()
+    else:
+        test_data = new_py / "CVRP" / "vrp100_test_seed1234.pt"
+    return CaseConfig(
+        "cvrp{}_split".format(args.split_size),
+        "CVRP",
+        args.split_size,
+        Path(args.split_checkpoint_dir).expanduser().resolve(),
+        args.split_epoch,
+        10_000,
+        400,
+        "giant tour + Split; x8 aug pre-expansion batch (matches cvrp100 baseline)",
+        no_aug_batch_size=1_000,
+        no_aug_batch_size_basis="giant tour + Split no-augmentation batch",
+        saved_test_data=test_data,
+        note="Giant tour policy + optimal Bellman Split, same fixed test set.",
+        use_split=True,
+    )
+
+
 def add_import_paths(pomo_root):
     new_py = pomo_root / "NEW_py_ver"
     paths = [
@@ -218,6 +248,7 @@ def add_import_paths(pomo_root):
         new_py / "TSP" / "POMO",
         new_py / "CVRP",
         new_py / "CVRP" / "POMO",
+        new_py / "CVRP" / "POMO_SPLIT",
     ]
     for path in reversed(paths):
         text = str(path)
@@ -296,17 +327,29 @@ def synchronize_cuda(device):
         torch.cuda.synchronize(device)
 
 
-def make_env_and_model(case, pomo_root):
+def make_env_and_model(case, pomo_root, device):
     add_import_paths(pomo_root)
     if case.problem == "TSP":
         from TSPEnv import TSPEnv as Env
         from TSPModel import TSPModel as Model
-    elif case.problem == "CVRP":
+        return Env(problem_size=case.size, pomo_size=case.size), Model(**MODEL_PARAMS)
+    if case.problem == "CVRP":
+        if case.use_split:
+            # Giant tour + Split model: the policy emits only a customer
+            # permutation; the env applies optimal Bellman Split at the end.
+            from GiantTourEnv import GiantTourEnv as Env
+            from GiantTourModel import GiantTourModel as Model
+            env = Env(
+                problem_size=case.size,
+                pomo_size=case.size,
+                capacity=1.0,
+                device=device,
+            )
+            return env, Model(**MODEL_PARAMS)
         from CVRPEnv import CVRPEnv as Env
         from CVRPModel import CVRPModel as Model
-    else:
-        raise ValueError("Unsupported problem type: {}".format(case.problem))
-    return Env(problem_size=case.size, pomo_size=case.size), Model(**MODEL_PARAMS)
+        return Env(problem_size=case.size, pomo_size=case.size), Model(**MODEL_PARAMS)
+    raise ValueError("Unsupported problem type: {}".format(case.problem))
 
 
 def run_one_batch(env, model, batch_size, aug_factor):
@@ -373,7 +416,7 @@ def run_case(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     device = configure_device(device_name, cuda_device)
-    env, model = make_env_and_model(case, pomo_root)
+    env, model = make_env_and_model(case, pomo_root, device)
 
     state = torch.load(str(checkpoint), map_location=device)
     checkpoint_epoch = state.get("epoch")
@@ -444,6 +487,10 @@ def run_case(
         "case": case.name,
         "problem": case.problem,
         "n": case.size,
+        "use_split": case.use_split,
+        "model_kind": (
+            "pomo_giant_tour_split" if case.use_split else "pomo_cvrp_native"
+        ),
         "run_scope": mode,
         "formal_target": is_formal,
         "evaluation_mode": (
@@ -549,6 +596,43 @@ def main():
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--use-split",
+        action="store_true",
+        help=(
+            "Also evaluate the giant-tour + Split model (CVRP only) on the same "
+            "fixed test set, appending a split row to the CSV for comparison. "
+            "Requires --split-checkpoint-dir and --split-epoch."
+        ),
+    )
+    parser.add_argument(
+        "--split-checkpoint-dir",
+        default=None,
+        help=(
+            "Directory holding the trained POMO_SPLIT checkpoint-<epoch>.pt "
+            "(a GiantTourTrainer result folder). Required with --use-split."
+        ),
+    )
+    parser.add_argument(
+        "--split-epoch",
+        type=int,
+        default=None,
+        help="Epoch of the POMO_SPLIT checkpoint to load. Required with --use-split.",
+    )
+    parser.add_argument(
+        "--split-test-data",
+        default=None,
+        help=(
+            "Fixed CVRP test set for the split model. Defaults to the same "
+            "vrp100_test_seed1234.pt the cvrp100 baseline uses."
+        ),
+    )
+    parser.add_argument(
+        "--split-size",
+        type=int,
+        default=100,
+        help="Problem size for the split case (default: 100).",
+    )
     args = parser.parse_args()
 
     pomo_root = Path(args.pomo_root).expanduser().resolve()
@@ -569,9 +653,15 @@ def main():
 
     aug_factor = 1 if args.no_augmentation else 8
 
+    run_list = [cases[name] for name in args.cases]
+    if args.use_split:
+        split_case = build_split_case(pomo_root, args)
+        if args.mode == "full" and split_case.problem == "TSP":
+            raise ValueError("Split evaluation supports CVRP only.")
+        run_list.append(split_case)
+
     rows = []
-    for name in args.cases:
-        case = cases[name]
+    for case in run_list:
         episodes = (
             args.episodes
             if args.episodes is not None
