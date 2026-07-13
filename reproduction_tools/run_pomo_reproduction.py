@@ -239,6 +239,37 @@ def build_split_case(pomo_root, args):
     )
 
 
+def build_native_cvrp_case(pomo_root, args):
+    if args.cvrp_checkpoint_dir is None or args.cvrp_epoch is None:
+        raise ValueError(
+            "--cvrp-checkpoint-dir requires --cvrp-epoch."
+        )
+    new_py = pomo_root / "NEW_py_ver"
+    if args.cvrp_test_data is not None:
+        test_data = Path(args.cvrp_test_data).expanduser().resolve()
+    else:
+        if args.cvrp_size != 100:
+            raise ValueError(
+                "--cvrp-test-data is required when --cvrp-size is not 100."
+            )
+        test_data = new_py / "CVRP" / "vrp100_test_seed1234.pt"
+    return CaseConfig(
+        "cvrp{}_native".format(args.cvrp_size),
+        "CVRP",
+        args.cvrp_size,
+        Path(args.cvrp_checkpoint_dir).expanduser().resolve(),
+        args.cvrp_epoch,
+        10_000,
+        400,
+        "native POMO CVRP; x8 aug pre-expansion batch",
+        no_aug_batch_size=1_000,
+        no_aug_batch_size_basis="native POMO CVRP no-augmentation batch",
+        saved_test_data=test_data,
+        note="Native POMO CVRP on a custom fixed test set.",
+        use_split=False,
+    )
+
+
 def add_import_paths(pomo_root):
     new_py = pomo_root / "NEW_py_ver"
     paths = [
@@ -633,32 +664,77 @@ def main():
         default=100,
         help="Problem size for the split case (default: 100).",
     )
+    parser.add_argument(
+        "--no-builtin-cases",
+        action="store_true",
+        help=(
+            "Skip the built-in tsp*/cvrp100 cases; run only the cases built "
+            "from --cvrp-checkpoint-dir and/or --use-split."
+        ),
+    )
+    parser.add_argument(
+        "--cvrp-checkpoint-dir",
+        default=None,
+        help=(
+            "Directory holding a native POMO CVRP checkpoint-<epoch>.pt to "
+            "evaluate on a custom test set (e.g. your CVRP50 model). Requires "
+            "--cvrp-epoch."
+        ),
+    )
+    parser.add_argument(
+        "--cvrp-epoch",
+        type=int,
+        default=None,
+        help="Epoch of the native CVRP checkpoint. Required with --cvrp-checkpoint-dir.",
+    )
+    parser.add_argument(
+        "--cvrp-size",
+        type=int,
+        default=100,
+        help="Problem size for the custom native CVRP case (default: 100).",
+    )
+    parser.add_argument(
+        "--cvrp-test-data",
+        default=None,
+        help=(
+            "Fixed CVRP test set for the custom native case. Defaults to the "
+            "built-in vrp100_test_seed1234.pt (only valid when --cvrp-size 100)."
+        ),
+    )
     args = parser.parse_args()
 
     pomo_root = Path(args.pomo_root).expanduser().resolve()
     validate_pomo_root(pomo_root)
     cases = build_cases(pomo_root)
-    unknown = [name for name in args.cases if name not in cases]
-    if unknown:
-        raise KeyError(
-            "Unknown case(s) {}. Available: {}.".format(
-                ", ".join(unknown), ", ".join(sorted(cases))
+
+    if args.no_builtin_cases:
+        run_list = []
+    else:
+        unknown = [name for name in args.cases if name not in cases]
+        if unknown:
+            raise KeyError(
+                "Unknown case(s) {}. Available: {}.".format(
+                    ", ".join(unknown), ", ".join(sorted(cases))
+                )
             )
+        run_list = [cases[name] for name in args.cases]
+
+    if args.cvrp_checkpoint_dir is not None:
+        run_list.append(build_native_cvrp_case(pomo_root, args))
+    if args.use_split:
+        run_list.append(build_split_case(pomo_root, args))
+
+    if not run_list:
+        raise ValueError(
+            "No cases to run. Provide --cases, --cvrp-checkpoint-dir, or --use-split."
         )
-    if args.mode == "full" and any(cases[name].problem == "TSP" for name in args.cases):
+    if args.mode == "full" and any(case.problem == "TSP" for case in run_list):
         raise ValueError(
             "Full TSP evaluation is forbidden in this random-data runner. "
             "Use run_pomo_tsp_fixed_eval.py with --test-data."
         )
 
     aug_factor = 1 if args.no_augmentation else 8
-
-    run_list = [cases[name] for name in args.cases]
-    if args.use_split:
-        split_case = build_split_case(pomo_root, args)
-        if args.mode == "full" and split_case.problem == "TSP":
-            raise ValueError("Split evaluation supports CVRP only.")
-        run_list.append(split_case)
 
     rows = []
     for case in run_list:
